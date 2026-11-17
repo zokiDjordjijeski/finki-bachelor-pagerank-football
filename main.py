@@ -2,55 +2,62 @@ import sys
 import os
 import glob
 import warnings
-from datetime import timedelta
+import requests
 
 import pandas as pd
 import networkx as nx
+import matplotlib.pyplot as plt
+import seaborn as sns
+import openpyxl
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 warnings.simplefilter(action="ignore", category=UserWarning)
 
+
 # ---------------------------------------------------------------------------
-# КОНФИГУРАЦИЈА И ИЗБОР НА СЦЕНАРИО
+# 1. АВТОМАТСКО СИМНУВАЊЕ НА НАЈНОВИТЕ ФАЈЛОВИ ЗА ДОМАШНИТЕ ЛИГИ
 # ---------------------------------------------------------------------------
-# Избери сценарио: 1 (сите лиги рамноправни) или 2 (прогресивни европски коефициенти)
-SCENARIO = 1
-
-if SCENARIO == 1:
-    COMPETITION_COEF = {
-        "Premier League": 1.0,
-        "Champions League": 1.0,
-        "La Liga": 1.0,
-        "Serie A": 1.0,
-        "Bundesliga": 1.0,
-        "Ligue 1": 1.0,
-        "Eredivisie": 1.0,
-        "Europa League": 1.0,
-        "Conference League": 1.0,
-        "Championship": 1.0,
-        "Scottish Premiership": 1.0,
+def download_latest_data():
+    leagues = {
+        "E0": "https://football-data.co.uk/mmz4281/2627/E0.csv",
+        "E1": "https://football-data.co.uk/mmz4281/2627/E1.csv",
+        "SP1": "https://football-data.co.uk/mmz4281/2627/SP1.csv",
+        "I1": "https://football-data.co.uk/mmz4281/2627/I1.csv",
+        "D1": "https://football-data.co.uk/mmz4281/2627/D1.csv",
+        "F1": "https://football-data.co.uk/mmz4281/2627/F1.csv",
+        "N1": "https://football-data.co.uk/mmz4281/2627/N1.csv",
+        "SC0": "https://football-data.co.uk/mmz4281/2627/SC0.csv",
     }
-else:
-    # Сценарио 2: Реална хиерархија (врвни лиги 1.0, послаби/втори лиги со помал пондер)
-    COMPETITION_COEF = {
-        # Прва класа - Врвни европски лиги
-        "Premier League": 1.0,
-        "La Liga": 1.0,
-        "Serie A": 1.0,
-        "Bundesliga": 1.0,
-        "Ligue 1": 1.0,
-        "Eredivisie": 0.8,
 
-        # Понизок ранг - Чемпионшип и Шкотска со поагресивно намалени коефициенти
-        "Championship": 0.6,
-        "Scottish Premiership": 0.4,
+    os.makedirs("data", exist_ok=True)
+    print("Проверка на локалните фајлови и обид за ажурирање...")
+    for code, url in leagues.items():
+        try:
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                file_path = os.path.join("data", f"{code}_26-27.csv")
+                with open(file_path, "wb") as f:
+                    f.write(response.content)
+        except Exception:
+            pass
+    print("Проверката заврши.\n")
 
-        # Европски купови со повисок пондер (пред ескалацијата по фази)
-        "Champions League": 1.5,
-        "Europa League": 1.3,
-        "Conference League": 1.2,
-    }
-# Домашни лиги: код на фајл -> име на натпреварување
+
+# ---------------------------------------------------------------------------
+# 2. КОНФИГУРАЦИЈА И ИЗБОР НА СЦЕНАРИО
+# ---------------------------------------------------------------------------
+SCENARIO = 2
+
+COMPETITION_COEF = {
+    "Premier League": 1.0, "La Liga": 1.0, "Serie A": 1.0,
+    "Bundesliga": 1.0, "Ligue 1": 1.0, "Eredivisie": 0.8,
+    "Championship": 0.6, "Scottish Premiership": 0.4,
+    "National Cup": 0.9,
+    "Champions League": 1.5,
+    "Europa League": 1.3,
+    "Conference League": 1.2,
+}
+
 LEAGUE_CODES = {
     "e0": "Premier League",
     "e1": "Championship",
@@ -62,13 +69,16 @@ LEAGUE_CODES = {
     "sc0": "Scottish Premiership",
 }
 
-# Што добива губитникот назад (спречува "dangling" чворови без излезни рабови)
 LOSS_BACK = 0.10
-GOAL_BONUS = 0.05  # бонус по гол разлика (макс 3 гола)
+GOAL_BONUS = 0.05
 
-# Мапирање на имиња на тимови за да се спојат домашните и европските фајлови
 TEAM_NAME_MAPPING = {
-    "Paris SG": "PSG",  # Го спојува "Paris SG" од француска лига со "PSG" од ЛШ
+    "Paris SG": "PSG",
+    "Paris Saint Germain": "PSG",
+    "Paris Saint-Germain": "PSG",
+    "Bayern München": "Bayern Munich",
+    "Manchester Utd": "Manchester United",
+    "Man United": "Manchester United",
 }
 
 COLUMN_MAPPING = {
@@ -79,12 +89,11 @@ COLUMN_MAPPING = {
     "HG": "FTHG", "AG": "FTAG",
     "homeScore": "FTHG", "awayScore": "FTAG",
     "HomeGoals": "FTHG", "AwayGoals": "FTAG",
-    "matchDate": "Date", "date": "Date",
+    "matchDate": "Date", "date": "Date", "Date": "Date"
 }
 
 
 def detect_competition(path):
-    """Строго препознавање според името на фајлот (case-insensitive)."""
     name = os.path.basename(path).lower()
     if "champions" in name:
         return "Champions League"
@@ -92,6 +101,8 @@ def detect_competition(path):
         return "Europa League"
     if "conference" in name:
         return "Conference League"
+    if "cup" in name or "fa" in name or "copa" in name:
+        return "National Cup"
 
     for code, comp in LEAGUE_CODES.items():
         if name.startswith(code):
@@ -100,28 +111,25 @@ def detect_competition(path):
 
 
 def stage_multiplier(comp, match_date):
-    """Го зголемува коефициентот за елиминациските фази во еврокуповите (Само за Сценарио 2)."""
     if SCENARIO == 1 or comp not in ["Champions League", "Europa League", "Conference League"]:
+        return 1.0
+    if pd.isna(match_date):
         return 1.0
 
     m = match_date.month
     d = match_date.day
 
     if m == 2:
-        return 1.1  # Плејоф за нокаут фаза
+        return 1.1
     elif m == 3:
-        return 1.2  # Осминафинале (1/8 финале)
+        return 1.2
     elif m == 4:
-        return 1.4  # Четвртфинале (1/4 финале)
+        return 1.4
     elif m == 5:
-        if d < 20:
-            return 1.6  # Полуфинале
-        else:
-            return 1.8  # Финале
+        return 1.6 if d < 20 else 1.8
     elif m == 6:
-        return 1.8  # Финале (ако е во јуни)
-
-    return 1.0  # Групна / Лигашка фаза (Септември - Јануари)
+        return 1.8
+    return 1.0
 
 
 def time_weight_for(days):
@@ -139,28 +147,33 @@ def add_edge(G, u, v, w):
         G.add_edge(u, v, weight=w)
 
 
-def load_data(pattern, only=None):
+def load_data(pattern):
     files = sorted(glob.glob(pattern))
-    print(f"Пронајдени се {len(files)} CSV фајлови. (Активно Сценарио: {SCENARIO})")
+    print(f"Пронајдени се {len(files)} CSV фајлови во папката data. (Активно Сценарио: {SCENARIO})")
     frames = []
     print(f"\n{'Фајл':<45}{'Натпреварување':<24}{'Коеф.':>7}{'Редови':>8}")
+
     for f in files:
         comp = detect_competition(f)
         if comp is None:
-            print(f"{os.path.basename(f):<45}{'НЕПРЕПОЗНАЕН - прескокнат':<24}")
-            continue
-        if only and comp.lower() != only.lower():
             continue
         try:
             df = pd.read_csv(f)
-        except Exception as e:
-            print(f"Грешка кај {f}: {e}")
+        except Exception:
             continue
+
         df = df.rename(columns=COLUMN_MAPPING)
+
+        if "Score" in df.columns and ("FTHG" not in df.columns or df["FTHG"].isna().all()):
+            score_split = df["Score"].dropna().str.split("-", expand=True)
+            if score_split.shape[1] == 2:
+                df["FTHG"] = pd.to_numeric(score_split[0], errors="coerce")
+                df["FTAG"] = pd.to_numeric(score_split[1], errors="coerce")
+
         need = {"Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"}
         if not need.issubset(df.columns):
-            print(f"{os.path.basename(f):<45}{'недостасуваат колони':<24}")
             continue
+
         df = df[list(need)].copy()
         df["Date"] = pd.to_datetime(df["Date"], format="mixed", dayfirst=True, errors="coerce")
         df["FTHG"] = pd.to_numeric(df["FTHG"], errors="coerce")
@@ -169,23 +182,15 @@ def load_data(pattern, only=None):
         df["HomeTeam"] = df["HomeTeam"].astype(str).str.strip().replace(TEAM_NAME_MAPPING)
         df["AwayTeam"] = df["AwayTeam"].astype(str).str.strip().replace(TEAM_NAME_MAPPING)
         df["Comp"] = comp
-        df["LeagueWeight"] = COMPETITION_COEF[comp]
-        print(f"{os.path.basename(f):<45}{comp:<24}{COMPETITION_COEF[comp]:>7.3f}{len(df):>8}")
+        df["LeagueWeight"] = COMPETITION_COEF.get(comp, 1.0)
+
+        print(f"{os.path.basename(f):<45}{comp:<24}{df['LeagueWeight'].iloc[0]:>7.3f}{len(df):>8}")
         frames.append(df)
+
     if not frames:
         print("Нема податоци за обработка.")
         sys.exit()
     return pd.concat(frames, ignore_index=True)
-
-
-def check_team_names(master):
-    euro = master[master.Comp.isin(["Champions League", "Europa League", "Conference League"])]
-    dom = master[~master.Comp.isin(["Champions League", "Europa League", "Conference League"])]
-    euro_teams = set(euro.HomeTeam) | set(euro.AwayTeam)
-    dom_teams = set(dom.HomeTeam) | set(dom.AwayTeam)
-    missing = sorted(euro_teams - dom_teams)
-    print(f"\n[ПРОВЕРКА ИМИЊА] {len(missing)} еврокуп-тимови не постојат во домашните фајлови.")
-    print(", ".join(missing))
 
 
 def build_graph(df, max_date):
@@ -196,7 +201,8 @@ def build_graph(df, max_date):
         counts[h] = counts.get(h, 0) + 1
         counts[a] = counts.get(a, 0) + 1
 
-        tw = time_weight_for((max_date - row.Date).days)
+        days_diff = (max_date - row.Date).days if pd.notna(row.Date) else 0
+        tw = time_weight_for(days_diff)
         sm = stage_multiplier(row.Comp, row.Date)
         base = tw * row.LeagueWeight * sm
 
@@ -215,52 +221,53 @@ def build_graph(df, max_date):
     return G, counts
 
 
-def points_table(df_league):
-    pts, gd = {}, {}
-    for r in df_league.itertuples():
-        h, a = r.HomeTeam, r.AwayTeam
-        pts.setdefault(h, 0);
-        pts.setdefault(a, 0)
-        gd[h] = gd.get(h, 0) + r.FTHG - r.FTAG
-        gd[a] = gd.get(a, 0) + r.FTAG - r.FTHG
-        if r.FTHG > r.FTAG:
-            pts[h] += 3
-        elif r.FTAG > r.FTHG:
-            pts[a] += 3
-        else:
-            pts[h] += 1;
-            pts[a] += 1
-    return pts
-
-
 def main():
-    choice_arg = sys.argv[1] if len(sys.argv) > 1 else None
-    only_code = sys.argv[2].lower() if len(sys.argv) > 2 else None
-    only = LEAGUE_CODES.get(only_code) if only_code else None
+    download_latest_data()
+    master = load_data("data/*.csv")
 
-    master = load_data("data/*.csv", only=only)
-    if not only:
-        check_team_names(master)
+    if master.empty or "Date" not in master.columns:
+        print("Нема доволно податоци.")
+        sys.exit()
+
     max_date = master["Date"].max()
 
     print("\n" + "=" * 50)
-    print(f"ПОСЛЕДЕН ДАТУМ ВО БАЗАТА: {max_date.strftime('%d.%m.%Y')} (Сценарио {SCENARIO})")
+    print(" ИЗБЕРЕТЕ ВРЕМЕНСКИ ПЕРИОД ЗА PAGERANK МОДЕЛОТ:")
     print("=" * 50)
-    print("1 - 7 дена | 2 - 30 дена | 3 - 90 дена | 4 - 180 дена | 5 - сите")
-    choice = choice_arg or input("Избор (1-5): ").strip()
+    print(" 1. Последни 3 месеци")
+    print(" 2. Последни 6 месеци")
+    print(" 3. Последни 12 месеци (Една година)")
+    print(" 4. Само тековната сезона (од Август 2026 па натаму)")
+    print(" 5. Сите достапни податоци (Без филтер)")
+    print("=" * 50)
 
-    days_map = {"1": (7, 2), "2": (30, 5), "3": (90, 10), "4": (180, 15)}
-    if choice in days_map:
-        days, min_matches = days_map[choice]
-        df = master[master["Date"] >= max_date - timedelta(days=days)].copy()
-        label = f"последни {days} дена"
+    choice = input("Внесете број на опција (1-5): ").strip()
+
+    if choice == "1":
+        cutoff_date = max_date - pd.DateOffset(months=3)
+        master = master[master["Date"] >= cutoff_date]
+        print("\n[ИЗБРАНО] Филтрирано: Последни 3 месеци")
+    elif choice == "2":
+        cutoff_date = max_date - pd.DateOffset(months=6)
+        master = master[master["Date"] >= cutoff_date]
+        print("\n[ИЗБРАНО] Филтрирано: Последни 6 месеци")
+    elif choice == "3":
+        cutoff_date = max_date - pd.DateOffset(months=12)
+        master = master[master["Date"] >= cutoff_date]
+        print("\n[ИЗБРАНО] Филтрирано: Последни 12 месеци")
+    elif choice == "4":
+        cutoff_date = pd.Timestamp("2026-08-01")
+        master = master[master["Date"] >= cutoff_date]
+        print("\n[ИЗБРАНО] Филтрирано: Тековна сезона (од Август 2026)")
     else:
-        df = master.copy()
-        min_matches = 25
-        label = "сите податоци"
-    if only:
-        min_matches = min(min_matches, 10)
-    print(f"Анализирање на {len(df)} натпревари ({label})...")
+        print("\n[ИЗБРАНО] Без временски филтер (Сите податоци)")
+
+    print(f"Вкупен број на натпревари по филтрирањето: {len(master)}")
+    print(f"ПОСЛЕДЕН ДАТУМ ВО АНАЛИЗАТА: {max_date.strftime('%d.%m.%Y')} (Сценарио {SCENARIO})")
+    print("=" * 50)
+
+    df = master.copy()
+    min_matches = 10  # Намалено на 10 за да се сигурни дека сите клубови ќе влезат во листата
 
     G, counts = build_graph(df, max_date)
     scores = nx.pagerank(G, weight="weight", alpha=0.85)
@@ -270,21 +277,38 @@ def main():
     )
 
     print("\n" + "=" * 50)
-    print(f"--- РАНГ ЛИСТА (Сценарио {SCENARIO} - {label}), мин. {min_matches} натпревари ---")
+    print(f"--- РАНГ ЛИСТА (Сценарио {SCENARIO}), мин. {min_matches} натпревари ---")
     print("=" * 50)
-    for i, (t, s) in enumerate(ranked[:25 if not only else 30], 1):
+    for i, (t, s) in enumerate(ranked[:25], 1):
         print(f"{i:2d}. {t:<22}: {s:.5f}  (натпревари: {counts[t]})")
 
-    if only:
-        pts = points_table(df)
-        common = [t for t, _ in ranked if t in pts]
-        if len(common) >= 5:
-            pr = pd.Series({t: scores[t] for t in common})
-            pt = pd.Series({t: pts[t] for t in common})
-            print(f"\n[ВАЛИДАЦИЈА] Spearman корелација PageRank vs бодови: {pr.corr(pt, method='spearman'):.3f}")
-            print("\nТабела по бодови (за споредба):")
-            for i, (t, p) in enumerate(sorted(pts.items(), key=lambda x: -x[1]), 1):
-                print(f"{i:2d}. {t:<22}{p:>4} бода")
+    results_df = pd.DataFrame(ranked, columns=["Team", "PageRank_Score"])
+    results_df["Matches_Played"] = results_df["Team"].map(counts)
+    results_df["PageRank_Score"] = results_df["PageRank_Score"].round(5)
+
+    excel_filename = f"PageRank_Rezultati_Scenarioto_{SCENARIO}.xlsx"
+    with pd.ExcelWriter(excel_filename, engine="openpyxl") as writer:
+        results_df.to_excel(writer, index=False, sheet_name="PageRank Top List")
+    print(f"\n[ИНФО] Резултатите се зачувани во Excel: {excel_filename}")
+
+    # Визуелен граф за Топ 15 (безбедно цртање)
+    if not results_df.empty:
+        plt.figure(figsize=(10, 6))
+        sns.set_theme(style="whitegrid")
+
+        top_15 = results_df.head(15)
+        sns.barplot(x="PageRank_Score", y="Team", data=top_15, palette="Blues_r")
+
+        plt.title(f"Top 15 Football Teams - PageRank Model (Scenario {SCENARIO})", fontsize=14, fontweight="bold",
+                  pad=15)
+        plt.xlabel("PageRank Score", fontsize=12)
+        plt.ylabel("Team", fontsize=12)
+        plt.tight_layout()
+
+        graph_filename = f"PageRank_Top15_Scenarioto_{SCENARIO}.png"
+        plt.savefig(graph_filename, dpi=300)
+        plt.close()
+        print(f"[ИНФО] Визуелниот граф е зачуван како слика: {graph_filename}")
 
 
 if __name__ == "__main__":
