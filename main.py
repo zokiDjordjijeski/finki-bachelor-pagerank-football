@@ -36,15 +36,16 @@ logging.basicConfig(
 logger = logging.getLogger("pagerank")
 
 # ---------------------------------------------------------------------------
-# Configuration (Избор на Сценарио: 1 или 2)
+# Configuration (Избор на Сценарио: 1, 2 или 3)
 # ---------------------------------------------------------------------------
-SCENARIO = int(input("Изберете сценарио (1 - Хомогени тежини, 2 - Хиерархиски тежини): ").strip() or "2")
+SCENARIO = int(input("Изберете сценарио (1 - Хомогени, 2 - Хиерархиски, 3 - Линеарно опаѓање 5м): ").strip() or "3")
 MIN_MATCHES = 10
 PAGERANK_ALPHA = 0.85
 DRAW_WEIGHT = 0.55
 LOSS_BACK = 0.10
 GOAL_BONUS = 0.05
 DATA_DIR = "data"
+CUPS_DIR = "cups"
 DOWNLOAD_TIMEOUT_SEC = 8
 MIN_CSV_BYTES = 80
 
@@ -61,6 +62,14 @@ COMPETITION_COEF: dict[str, float] = {
     "Champions League": 1.5,
     "Europa League": 1.3,
     "Conference League": 1.2,
+    "FA Cup": 0.9,
+    "Copa del Rey": 0.9,
+    "DFB-Pokal": 0.9,
+    "Coppa Italia": 0.9,
+    "EFL Cup": 0.9,
+    "UEFA Champions League": 1.5,
+    "UEFA Europa League": 1.3,
+    "UEFA Conference League": 1.2,
 }
 
 LEAGUE_CODES: dict[str, str] = {
@@ -75,10 +84,10 @@ LEAGUE_CODES: dict[str, str] = {
 }
 
 EUROPEAN_COMPS = frozenset(
-    {"Champions League", "Europa League", "Conference League"}
+    {"Champions League", "Europa League", "Conference League", "UEFA Champions League", "UEFA Europa League", "UEFA Conference League"}
 )
 
-# Canonical club names so Football-Data.co.uk and Footiqo become one graph node.
+# Canonical club names
 TEAM_NAME_MAPPING: dict[str, str] = {
     "Paris SG": "PSG",
     "Paris Saint Germain": "PSG",
@@ -107,6 +116,8 @@ COLUMN_MAPPING: dict[str, str] = {
     "Away": "AwayTeam",
     "homeTeam": "HomeTeam",
     "awayTeam": "AwayTeam",
+    "home_team": "HomeTeam",
+    "away_team": "AwayTeam",
     "Team1": "HomeTeam",
     "Team2": "AwayTeam",
     "Home_Team": "HomeTeam",
@@ -115,10 +126,14 @@ COLUMN_MAPPING: dict[str, str] = {
     "AG": "FTAG",
     "homeScore": "FTHG",
     "awayScore": "FTAG",
+    "ft_home": "FTHG",
+    "ft_away": "FTAG",
     "HomeGoals": "FTHG",
     "AwayGoals": "FTAG",
     "matchDate": "Date",
     "date": "Date",
+    "kickoff_utc": "Date",
+    "league_name": "Comp",
 }
 
 REQUIRED_COLUMNS = frozenset({"Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"})
@@ -136,7 +151,7 @@ FOOTBALL_DATA_URLS: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
-# Downloads ( со паметно кеширање - нема непотребно чекање на секое пуштање )
+# Downloads (со паметно кеширање)
 # ---------------------------------------------------------------------------
 def _looks_like_csv(content: bytes) -> bool:
     if len(content) < MIN_CSV_BYTES:
@@ -149,9 +164,7 @@ def _looks_like_csv(content: bytes) -> bool:
 
 
 def download_latest_data() -> None:
-    """Ажурирај ги лигите само ако локалните фајлови се стари (над 24ч) или недостигаат."""
     os.makedirs(DATA_DIR, exist_ok=True)
-
     all_exist = True
     for code in FOOTBALL_DATA_URLS:
         dest = os.path.join(DATA_DIR, f"{code}_26-27.csv")
@@ -177,24 +190,19 @@ def download_latest_data() -> None:
                 headers={"User-Agent": "FINKI-PageRank-Thesis/1.0"},
             )
         except requests.RequestException as exc:
-            logger.warning("Download failed for %s (%s): %s — keeping local file.", code, url, exc)
+            logger.warning("Download failed for %s (%s): %s", code, url, exc)
             continue
 
-        if response.status_code != 200:
-            continue
-
-        body = response.content
-        if not body or not _looks_like_csv(body):
+        if response.status_code != 200 or not _looks_like_csv(response.content):
             continue
 
         with open(dest, "wb") as handle:
-            handle.write(body)
-        logger.info("Updated %s (%d bytes).", dest, len(body))
+            handle.write(response.content)
     print("Проверката заврши.\n")
 
 
 # ---------------------------------------------------------------------------
-# Competition / time weights
+# Competition / time weights (Сценарио 3)
 # ---------------------------------------------------------------------------
 def detect_competition(path: str) -> str | None:
     name = os.path.basename(path).lower()
@@ -213,7 +221,6 @@ def detect_competition(path: str) -> str | None:
 
 
 def stage_multiplier(comp: str, match_date: pd.Timestamp) -> float:
-    """Calendar-month proxy for European knockout importance (Scenario 2 only)."""
     if SCENARIO == 1 or comp not in EUROPEAN_COMPS:
         return 1.0
     if pd.isna(match_date):
@@ -235,7 +242,13 @@ def stage_multiplier(comp: str, match_date: pd.Timestamp) -> float:
 
 
 def time_weight_for(days: int) -> float:
-    """Piecewise recency weight; 30-day bins, floor 0.2 beyond 10 months."""
+    """Сценарио 3: Линеарно опаѓање за последните 5 месеци (150 дена)."""
+    if SCENARIO == 3:
+        max_days = 150
+        if days > max_days:
+            return 0.0
+        return max(0.0, 1.0 - (days / max_days))
+
     months = max(days, 0) / 30.0
     for limit, weight in (
         (1, 1.0),
@@ -253,53 +266,26 @@ def time_weight_for(days: int) -> float:
 
 
 def current_season_start(max_date: pd.Timestamp) -> pd.Timestamp:
-    """August 1 of the season that contains max_date (European calendar)."""
     year = int(max_date.year) if int(max_date.month) >= 8 else int(max_date.year) - 1
     return pd.Timestamp(year=year, month=8, day=1)
 
 
 # ---------------------------------------------------------------------------
-# Ingestion
+# Ingestion (Скротено само за потребните лиги и купови)
 # ---------------------------------------------------------------------------
 def _read_csv_safely(path: str) -> pd.DataFrame:
-    last_error: Exception | None = None
     for encoding in ("utf-8", "utf-8-sig", "latin-1"):
         try:
             return pd.read_csv(path, encoding=encoding)
-        except UnicodeDecodeError as exc:
-            last_error = exc
+        except UnicodeDecodeError:
             continue
         except Exception as exc:
             raise RuntimeError(f"{os.path.basename(path)}: {exc}") from exc
-    raise RuntimeError(f"{os.path.basename(path)}: encoding error ({last_error})")
-
-
-def _split_score_column(df: pd.DataFrame) -> pd.DataFrame:
-    if "Score" not in df.columns:
-        return df
-    goals_missing = "FTHG" not in df.columns or df["FTHG"].isna().all()
-    if not goals_missing:
-        return df
-
-    cleaned = (
-        df["Score"]
-        .astype(str)
-        .str.replace("–", "-", regex=False)
-        .str.replace("—", "-", regex=False)
-        .str.replace(":", "-", regex=False)
-    )
-    parts = cleaned.str.split("-", n=1, expand=True)
-    if parts.shape[1] != 2:
-        return df
-    df = df.copy()
-    df["FTHG"] = pd.to_numeric(parts[0], errors="coerce")
-    df["FTAG"] = pd.to_numeric(parts[1], errors="coerce")
-    return df
+    raise RuntimeError(f"{os.path.basename(path)}: encoding error")
 
 
 def _normalize_frame(df: pd.DataFrame, competition: str) -> tuple[pd.DataFrame, int]:
     df = df.rename(columns=COLUMN_MAPPING)
-    df = _split_score_column(df)
     if not REQUIRED_COLUMNS.issubset(df.columns):
         missing = sorted(REQUIRED_COLUMNS - set(df.columns))
         raise ValueError(f"missing columns {missing}")
@@ -322,74 +308,75 @@ def _normalize_frame(df: pd.DataFrame, competition: str) -> tuple[pd.DataFrame, 
 
 def load_data(pattern: str) -> pd.DataFrame:
     files = sorted(glob.glob(pattern))
-    print(f"Пронајдени се {len(files)} CSV фајлови во папката {DATA_DIR}. (Активно Сценарио: {SCENARIO})")
-    print(f"\n{'Фајл':<45}{'Натпреварување':<24}{'Статус':<14}{'Коеф.':>7}{'Редови':>8}{'Отфрлени':>10}")
+
+    cup_file = os.path.join(CUPS_DIR, "matches.csv")
+    if os.path.exists(cup_file):
+        files.append(cup_file)
+
+    print(f"Пронајдени се вкупно {len(files)} фајлови. Се вчитуваат само тимовите и лигите од фокусот...")
 
     frames: list[pd.DataFrame] = []
+
+    ALLOWED_COMPETITIONS = frozenset({
+        "Premier League", "La Liga", "Serie A", "Bundesliga", "Ligue 1",
+        "Eredivisie", "Championship", "Scottish Premiership",
+        "FA Cup", "Copa del Rey", "DFB-Pokal", "Coppa Italia", "EFL Cup",
+        "Champions League", "Europa League", "Conference League",
+        "UEFA Champions League", "UEFA Europa League", "UEFA Conference League"
+    })
+
     for path in files:
         basename = os.path.basename(path)
         competition = detect_competition(path)
-        if competition is None:
-            logger.warning("Skipped %s: competition not recognised from filename.", basename)
-            print(f"{basename:<45}{'—':<24}{'skipped':<14}{'—':>7}{'—':>8}{'—':>10}")
-            continue
         try:
             raw = _read_csv_safely(path)
+
+            if basename == "matches.csv":
+                raw = raw.rename(columns=COLUMN_MAPPING)
+                if "Comp" in raw.columns:
+                    for comp_name, group_df in raw.groupby("Comp"):
+                        comp_str = str(comp_name).strip()
+                        if comp_str in ALLOWED_COMPETITIONS:
+                            df_n, _ = _normalize_frame(group_df, comp_str)
+                            if not df_n.empty:
+                                frames.append(df_n)
+                                print(f"{'cups/matches.csv (' + comp_str + ')':<45}{comp_str:<24}{'ok':<14}{COMPETITION_COEF.get(comp_str, 0.9):>7.3f}{len(df_n):>8}")
+                continue
+
+            if competition is None or competition not in ALLOWED_COMPETITIONS:
+                continue
+
             df, dropped = _normalize_frame(raw, competition)
+            if not df.empty:
+                coef = float(df["LeagueWeight"].iloc[0])
+                print(f"{basename:<45}{competition:<24}{'ok':<14}{coef:>7.3f}{len(df):>8}")
+                frames.append(df)
         except Exception as exc:
             logger.error("Failed to load %s: %s", basename, exc)
-            print(f"{basename:<45}{competition:<24}{'FAILED':<14}{'—':>7}{'—':>8}{'—':>10}")
-            continue
-
-        if df.empty:
-            logger.warning("%s produced 0 valid rows (%d dropped).", basename, dropped)
-            print(f"{basename:<45}{competition:<24}{'empty':<14}{COMPETITION_COEF.get(competition, 1.0):>7.3f}{0:>8}{dropped:>10}")
-            continue
-
-        coef = float(df["LeagueWeight"].iloc[0])
-        print(f"{basename:<45}{competition:<24}{'ok':<14}{coef:>7.3f}{len(df):>8}{dropped:>10}")
-        if dropped:
-            logger.info("%s: dropped %d rows with missing date/teams/goals.", basename, dropped)
-        frames.append(df)
 
     if not frames:
         print("Нема податоци за обработка.")
         sys.exit(1)
-    return pd.concat(frames, ignore_index=True)
+
+    master_df = pd.concat(frames, ignore_index=True)
+
+    # КЛУЧНО: Отстранување на временска зона (tz-aware -> tz-naive) за да се избегне компарациска грешка
+    try:
+        if pd.api.types.is_datetime64tz_dtype(master_df["Date"]):
+            master_df["Date"] = master_df["Date"].dt.tz_localize(None)
+        else:
+            master_df["Date"] = pd.to_datetime(master_df["Date"], errors="coerce").dt.tz_localize(None)
+    except Exception:
+        master_df["Date"] = pd.to_datetime(master_df["Date"], errors="coerce").dt.tz_localize(None)
+
+    master_df = master_df.dropna(subset=["Date"])
+    return master_df
 
 
 def report_unmatched_team_names(df: pd.DataFrame, similarity_floor: float = 0.82) -> None:
-    """Surface leftover aliases after TEAM_NAME_MAPPING."""
     teams = sorted(set(df["HomeTeam"]).union(df["AwayTeam"]))
     print("\n--- Валидација на имиња на клубови ---")
     print(f"Уникатни клубови по мапирање: {len(teams)}")
-
-    mapped_targets = set(TEAM_NAME_MAPPING.values())
-    used_canonical = [name for name in sorted(mapped_targets) if name in teams]
-    print(f"Канонски имиња присутни во податоците: {', '.join(used_canonical) if used_canonical else '—'}")
-
-    suspects: list[tuple[str, str, float]] = []
-    for i, left in enumerate(teams):
-        for right in teams[i + 1 :]:
-            if left.split()[0].lower() == "inter" and right.split()[0].lower() == "inter":
-                continue
-            ratio = SequenceMatcher(None, left.lower(), right.lower()).ratio()
-            if ratio < similarity_floor:
-                continue
-            left_tokens = set(left.lower().replace(".", "").split())
-            right_tokens = set(right.lower().replace(".", "").split())
-            shared = {token for token in left_tokens & right_tokens if len(token) >= 4}
-            contained = left_tokens <= right_tokens or right_tokens <= left_tokens
-            if shared or (contained and min(len(left), len(right)) >= 6):
-                suspects.append((left, right, ratio))
-
-    if not suspects:
-        print("Нема преостанати блиски парови на имиња (праг %.2f)." % similarity_floor)
-        return
-
-    print("Можни немапирани алијаси (проверете рачно):")
-    for left, right, ratio in suspects:
-        print(f"  {left!r}  ~  {right!r}  (similarity={ratio:.2f})")
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +390,6 @@ def add_edge(graph: nx.DiGraph, source: str, target: str, weight: float) -> None
 
 
 def match_edge_weights(goal_diff: int, base: float) -> tuple[float, float]:
-    """Return (winner_inflow, loser_backflow) for a decisive result."""
     win_weight = (1.0 + GOAL_BONUS * min(goal_diff, 3)) * base
     return win_weight, LOSS_BACK * win_weight
 
@@ -418,8 +404,13 @@ def build_graph(df: pd.DataFrame, max_date: pd.Timestamp) -> tuple[nx.DiGraph, d
 
         days_diff = (max_date - row.Date).days if pd.notna(row.Date) else 0
         recency = time_weight_for(int(days_diff))
+        if SCENARIO == 3 and recency == 0.0:
+            continue
+
         stage = stage_multiplier(row.Comp, row.Date)
         base = recency * float(row.LeagueWeight) * stage
+        if base <= 0:
+            continue
 
         home_goals, away_goals = int(row.FTHG), int(row.FTAG)
         if home_goals == away_goals:
@@ -468,32 +459,23 @@ def prompt_horizon_choice() -> str:
     print(" 4. Само тековната сезона (од август)")
     print(" 5. Сите достапни податоци (Без филтер)")
     print("=" * 50)
-
-    valid = {"1", "2", "3", "4", "5"}
-    for attempt in range(1, 6):
-        raw = input("Внесете број на опција (1-5): ").strip()
-        if raw in valid:
-            return raw
-        print(f"Невалиден избор {raw!r}. Внесете број од 1 до 5. (обид {attempt}/5)")
-    print("Премногу невалидни обиди — се користи опција 5 (сите податоци).")
-    return "5"
+    return input("Внесете број на опција (1-5): ").strip() or "5"
 
 
 def apply_time_filter(master: pd.DataFrame, choice: str, max_date: pd.Timestamp) -> tuple[pd.DataFrame, str]:
+    if SCENARIO == 3:
+        cutoff = max_date - pd.DateOffset(months=5)
+        return master[master["Date"] >= cutoff], "Сценарио 3: Прозорец од последни 5 месеци (Линеарно опаѓање)"
     if choice == "1":
-        cutoff = max_date - pd.DateOffset(months=3)
-        return master[master["Date"] >= cutoff], "Последни 3 месеци"
+        return master[master["Date"] >= max_date - pd.DateOffset(months=3)], "Последни 3 месеци"
     if choice == "2":
-        cutoff = max_date - pd.DateOffset(months=6)
-        return master[master["Date"] >= cutoff], "Последни 6 месеци"
+        return master[master["Date"] >= max_date - pd.DateOffset(months=6)], "Последни 6 месеци"
     if choice == "3":
-        cutoff = max_date - pd.DateOffset(months=12)
-        return master[master["Date"] >= cutoff], "Последни 12 месеци"
+        return master[master["Date"] >= max_date - pd.DateOffset(months=12)], "Последни 12 месеци"
     if choice == "4":
         cutoff = current_season_start(max_date)
-        label = f"Тековна сезона (од {cutoff.strftime('%d.%m.%Y')})"
-        return master[master["Date"] >= cutoff], label
-    return master, "Без временски филтер (сите податоци)"
+        return master[master["Date"] >= cutoff], f"Тековна сезона (од {cutoff.strftime('%d.%m.%Y')})"
+    return master, "Без временски филтер"
 
 
 def export_results(ranked: list[tuple[str, float]], counts: dict[str, int]) -> pd.DataFrame:
@@ -509,37 +491,19 @@ def export_results(ranked: list[tuple[str, float]], counts: dict[str, int]) -> p
 
 def save_top15_chart(results: pd.DataFrame) -> None:
     if results.empty:
-        logger.warning("No ranked teams to plot.")
         return
-
     top_15 = results.head(15)
     plt.figure(figsize=(10, 6))
     sns.set_theme(style="whitegrid")
-    sns.barplot(
-        x="PageRank_Score",
-        y="Team",
-        data=top_15,
-        hue="Team",
-        palette="Blues_r",
-        legend=False,
-    )
-    plt.title(
-        f"Top 15 Football Teams - PageRank Model (Scenario {SCENARIO})",
-        fontsize=14,
-        fontweight="bold",
-        pad=15,
-    )
+    sns.barplot(x="PageRank_Score", y="Team", data=top_15, hue="Team", palette="Blues_r", legend=False)
+    plt.title(f"Top 15 Football Teams - PageRank Model (Scenario {SCENARIO})", fontsize=14, fontweight="bold", pad=15)
     plt.xlabel("PageRank Score", fontsize=12)
     plt.ylabel("Team", fontsize=12)
     plt.tight_layout()
 
     graph_filename = os.path.abspath(f"PageRank_Top15_Scenarioto_{SCENARIO}.png")
-    try:
-        plt.savefig(graph_filename, dpi=300)
-    except Exception as e:
-        logger.error("Could not save chart: %s", e)
-    finally:
-        plt.close()
+    plt.savefig(graph_filename, dpi=300)
+    plt.close()
     print(f"[ИНФО] Визуелниот граф е зачуван како слика: {graph_filename}")
 
 
@@ -561,17 +525,17 @@ def main() -> None:
     print("=" * 50)
 
     if filtered.empty:
-        print("Нема натпревари во избраниот период. Изберете поширок хоризонт.")
+        print("Нема натпревари во избраниот период.")
         sys.exit(1)
 
     graph, counts = build_graph(filtered, max_date)
     if graph.number_of_nodes() == 0 or graph.number_of_edges() == 0:
-        print("Графот е празен — PageRank не може да се пресмета.")
+        print("Графот е празен.")
         sys.exit(1)
 
     ranked = compute_ranking(graph, counts, MIN_MATCHES)
     if not ranked:
-        print(f"Нема клубови со најмалку {MIN_MATCHES} натпревари по филтрирањето.")
+        print(f"Нема клубови со најмалку {MIN_MATCHES} натпревари.")
         sys.exit(1)
 
     print("\n" + "=" * 50)
