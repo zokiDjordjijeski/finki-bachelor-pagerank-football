@@ -202,7 +202,7 @@ def download_latest_data() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Competition / time weights (Сценарио 3)
+# Competition / time weights
 # ---------------------------------------------------------------------------
 def detect_competition(path: str) -> str | None:
     name = os.path.basename(path).lower()
@@ -271,7 +271,7 @@ def current_season_start(max_date: pd.Timestamp) -> pd.Timestamp:
 
 
 # ---------------------------------------------------------------------------
-# Ingestion (Скротено само за потребните лиги и купови)
+# Ingestion
 # ---------------------------------------------------------------------------
 def _read_csv_safely(path: str) -> pd.DataFrame:
     for encoding in ("utf-8", "utf-8-sig", "latin-1"):
@@ -332,11 +332,12 @@ def load_data(pattern: str) -> pd.DataFrame:
             raw = _read_csv_safely(path)
 
             if basename == "matches.csv":
+                ONLY_CUPS = frozenset({"FA Cup", "Copa del Rey", "DFB-Pokal", "Coppa Italia", "EFL Cup"})
                 raw = raw.rename(columns=COLUMN_MAPPING)
                 if "Comp" in raw.columns:
                     for comp_name, group_df in raw.groupby("Comp"):
                         comp_str = str(comp_name).strip()
-                        if comp_str in ALLOWED_COMPETITIONS:
+                        if comp_str in ONLY_CUPS:
                             df_n, _ = _normalize_frame(group_df, comp_str)
                             if not df_n.empty:
                                 frames.append(df_n)
@@ -360,15 +361,7 @@ def load_data(pattern: str) -> pd.DataFrame:
 
     master_df = pd.concat(frames, ignore_index=True)
 
-    # КЛУЧНО: Отстранување на временска зона (tz-aware -> tz-naive) за да се избегне компарациска грешка
-    try:
-        if pd.api.types.is_datetime64tz_dtype(master_df["Date"]):
-            master_df["Date"] = master_df["Date"].dt.tz_localize(None)
-        else:
-            master_df["Date"] = pd.to_datetime(master_df["Date"], errors="coerce").dt.tz_localize(None)
-    except Exception:
-        master_df["Date"] = pd.to_datetime(master_df["Date"], errors="coerce").dt.tz_localize(None)
-
+    master_df["Date"] = pd.to_datetime(master_df["Date"], utc=True, errors="coerce").dt.tz_localize(None)
     master_df = master_df.dropna(subset=["Date"])
     return master_df
 
@@ -463,9 +456,6 @@ def prompt_horizon_choice() -> str:
 
 
 def apply_time_filter(master: pd.DataFrame, choice: str, max_date: pd.Timestamp) -> tuple[pd.DataFrame, str]:
-    if SCENARIO == 3:
-        cutoff = max_date - pd.DateOffset(months=5)
-        return master[master["Date"] >= cutoff], "Сценарио 3: Прозорец од последни 5 месеци (Линеарно опаѓање)"
     if choice == "1":
         return master[master["Date"] >= max_date - pd.DateOffset(months=3)], "Последни 3 месеци"
     if choice == "2":
@@ -475,7 +465,7 @@ def apply_time_filter(master: pd.DataFrame, choice: str, max_date: pd.Timestamp)
     if choice == "4":
         cutoff = current_season_start(max_date)
         return master[master["Date"] >= cutoff], f"Тековна сезона (од {cutoff.strftime('%d.%m.%Y')})"
-    return master, "Без временски филтер"
+    return master, "Без временски филтер (Сите податоци)"
 
 
 def export_results(ranked: list[tuple[str, float]], counts: dict[str, int]) -> pd.DataFrame:
@@ -517,8 +507,16 @@ def main() -> None:
         sys.exit(1)
 
     max_date = pd.Timestamp(master["Date"].max())
-    choice = prompt_horizon_choice()
-    filtered, label = apply_time_filter(master, choice, max_date)
+
+    # Сценарио 3 користи фиксно последни 150 дена (без мени), додека Сценарио 1 и 2 бараат избор од мени
+    if SCENARIO == 3:
+        cutoff = max_date - pd.DateOffset(days=150)
+        filtered = master[master["Date"] >= cutoff]
+        label = "Сценарио 3: Фиксно последни 150 дена (Линеарно опаѓање)"
+    else:
+        choice = prompt_horizon_choice()
+        filtered, label = apply_time_filter(master, choice, max_date)
+
     print(f"\n[ИЗБРАНО] {label}")
     print(f"Вкупен број на натпревари по филтрирањето: {len(filtered)}")
     print(f"ПОСЛЕДЕН ДАТУМ ВО АНАЛИЗАТА: {max_date.strftime('%d.%m.%Y')} (Сценарио {SCENARIO})")
